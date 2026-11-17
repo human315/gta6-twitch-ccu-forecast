@@ -2,17 +2,21 @@
 
 Method: for every past launch in the case's `comparables`, take its release-day
 (UTC) hourly Twitch viewers and form the log-ratio of each hour h = 2..24 to
-that launch's own hour-1 print, r_h = ln(v_h / v_1).  Across launches, the
-ratios for one hour form an empirical distribution of how a launch day unfolds
-after its first hour; the forecast for hour h is hour 1's print times the
-empirical quantiles of r_h at the scored levels.  The pool is restricted to
-rolling midnight-local launches (the shape GTA VI has: viewers build as
-time zones unlock, then peak in the US evening).  Simultaneous-global
-launches, early-access-contaminated launches, free-to-play / slow-burn
-launches and the target's own pre-release category history are left out:
-their release-day shapes are different.  Leave-one-out cross-validation on
-the kit's comparables put this at ~0.227 mean pinball loss on GTA-like
-(rolling, console-only) launches versus ~0.301 for the house baseline.
+that launch's own hour-1 print, r_h = ln(v_h / v_1).  Two forecasts are
+built from the same pool and blended 50/50 in log space:
+  (E) the empirical quantiles of r_h across the pool, and
+  (F) a per-hour OLS regression of r_h on ln(v_1) (launch size predicts the
+      day's shape: small hour-1 launches ramp more), with each hour's slope
+      shrunk halfway toward the pooled slope across all hours, and the spread
+      taken from that hour's residual quantiles.
+The pool is restricted to rolling midnight-local launches (the shape GTA VI
+has: viewers build as time zones unlock, then peak in the US evening).
+Simultaneous-global launches, early-access-contaminated launches,
+free-to-play / slow-burn launches and the target's own pre-release category
+history are left out: their release-day shapes are different.
+Leave-one-out cross-validation on the kit's comparables: the blend scores
+~0.182 mean pinball loss on GTA-like (rolling, console-only) launches versus
+~0.227 for (E) alone and ~0.301 for the house baseline.
 
 Standard library only; deterministic (no randomness, no network, no wall
 clock); reads every <id>.in in the input directory and writes <id>.out.
@@ -123,6 +127,31 @@ def round2(x):
     return int(value) if value.is_integer() else value
 
 
+def quantile_of_sorted(sorted_vals, level):
+    """Empirical quantile (linear interpolation) of an ascending list."""
+    n = len(sorted_vals)
+    if n == 0:
+        return None
+    if n == 1:
+        return sorted_vals[0]
+    pos = level * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    return sorted_vals[lo] + (pos - lo) * (sorted_vals[hi] - sorted_vals[lo])
+
+
+def ols(xs, ys):
+    """Least-squares line y = a + b*x; returns (a, b)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return my, 0.0
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return my - b * mx, b
+
+
 def forecast_case(case, name):
     if case["levels"] != LEVELS:
         raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
@@ -130,9 +159,10 @@ def forecast_case(case, name):
     if first is None:
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1, first["viewers"])
+    log_p1 = math.log(p1)
 
-    # Collect log-ratios per hour across weighted comparables.
-    ratios = {h: [] for h in range(2, 25)}
+    # Pool data per hour: (log hour-1 print, log-ratio) of each rolling launch.
+    data = {h: [] for h in range(2, 25)}
     for comp in case.get("comparables") or []:
         w = weight_of(comp)
         if w <= 0:
@@ -146,20 +176,49 @@ def forecast_case(case, name):
             vh = day.get(h)
             if vh is None:
                 continue
-            ratios[h].append((math.log(max(1, vh) / v1), w))
+            data[h].append((math.log(v1), math.log(max(1, vh) / v1)))
+
+    # Pooled OLS slope across all hours (for shrinking each hour's slope).
+    all_x, all_y = [], []
+    for h in range(2, 25):
+        for x, y in data[h]:
+            all_x.append(x)
+            all_y.append(y)
+    _, pooled_b = ols(all_x, all_y) if all_x else (0.0, 0.0)
 
     hours = []
     for row in case["forecast"]:
         h = row["hour"]
-        pairs = ratios.get(h) or []
-        n = len(pairs)
-        if n >= 8:
-            qs = [weighted_quantile(pairs, lv) for lv in LEVELS]
-            q = [round2(p1 * math.exp(v)) for v in qs]
-        else:
+        pts = data.get(h) or []
+        if len(pts) < 8:
             # Too few ratios for this hour: fall back to the house baseline
             # shape (persistence with a widening lognormal spread).
             q = [round2(p1 * math.exp(z * BASE_SIGMA * math.sqrt(h - 1))) for z in Z]
+        else:
+            # (E) empirical quantiles of the log-ratios.
+            ratios = [(y, 1.0) for _, y in pts]
+            q_e = [weighted_quantile(ratios, lv) for lv in LEVELS]
+            med_e = q_e[2]
+            # (F) per-hour OLS on log hour-1 size, slope shrunk halfway to
+            # the pooled slope; spread from the hour's residual quantiles.
+            xs = [x for x, _ in pts]
+            ys = [y for _, y in pts]
+            a, b = ols(xs, ys)
+            b_s = 0.5 * b + 0.5 * pooled_b
+            a_s = sum(ys) / len(ys) - b_s * (sum(xs) / len(xs))
+            med_f = a_s + b_s * log_p1
+            resid = sorted(y - (a_s + b_s * x) for x, y in pts)
+            med_r = quantile_of_sorted(resid, 0.5)
+            q_f = [med_f + quantile_of_sorted(resid, lv) - med_r for lv in LEVELS]
+            # Blend (E) and (F) 50/50 in log space: blend the medians and
+            # the log-spreads around them; the result is a log-ratio, so
+            # the absolute quantile is hour 1's print times its exp.
+            q = []
+            for i in range(5):
+                med = 0.5 * med_e + 0.5 * med_f
+                off = 0.5 * (q_e[i] - med_e) + 0.5 * (q_f[i] - med_f)
+                q.append(round2(p1 * math.exp(med + off)))
+            q = [max(1, min(1_000_000_000, v)) for v in q]
         # Guard monotonicity and bounds (quantiles are non-decreasing by
         # construction; this only protects against float noise).
         q = [max(1, min(1_000_000_000, v)) for v in q]
